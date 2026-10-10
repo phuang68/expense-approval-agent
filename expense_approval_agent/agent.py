@@ -16,13 +16,18 @@
 
 An expense report arrives as a JSON event (Pub/Sub push or local test payload).
 - Expenses under $100 are automatically approved in Python code without calling an LLM.
-- Expenses of $100 or more are analyzed by an LLM for risk factors, an alert is raised,
-  and the workflow pauses for human approval via RequestInput (HITL). Once decided,
-  the outcome is recorded.
+- Expenses of $100 or more pass through a security checkpoint before reaching the LLM:
+    1. Scrub PII (SSNs and credit cards) from description, tracking redacted categories.
+    2. Defend against prompt injection: if instructions attempting to force approval
+       or bypass rules are detected, the model is bypassed entirely and the report is
+       routed straight to human review as a security event.
+    3. Clean expenses proceed to the LLM reviewer for risk assessment, followed by
+       human approval (HITL) via RequestInput.
 """
 
 import base64
 import json
+import re
 from typing import Any
 
 from google.adk.agents import Agent
@@ -47,6 +52,12 @@ class ExpenseData(BaseModel):
     category: str = Field(description="Expense category (e.g., travel, meals, equipment)")
     description: str = Field(description="Business justification / description")
     date: str = Field(description="Date of the expense (YYYY-MM-DD)")
+    redacted_categories: list[str] = Field(
+        default_factory=list, description="Categories of PII redacted from description"
+    )
+    security_flag: str | None = Field(
+        default=None, description="Security flags raised if suspicious behavior detected"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +136,7 @@ def route_by_amount(node_input: dict[str, Any], ctx: Context) -> Event:
     """Evaluate the dollar threshold and route the workflow in Python code.
 
     - Under $100 -> AUTO_APPROVE (no LLM involved)
-    - $100 or more -> NEEDS_REVIEW (LLM review + HITL approval gate)
+    - $100 or more -> NEEDS_REVIEW (Security checkpoint before LLM review)
     """
     ctx.state["expense_data"] = node_input
     amount = float(node_input.get("amount", 0.0))
@@ -167,7 +178,117 @@ def auto_approve(node_input: dict[str, Any]) -> Event:
 
 
 # ---------------------------------------------------------------------------
-# Branch B: LLM Risk Assessment & Alert (>= $100)
+# Security Checkpoint: PII Redaction & Prompt Injection Defense
+# ---------------------------------------------------------------------------
+
+SSN_REGEX = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+CC_REGEX = re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b|\b\d{4}[-\s]\d{6}[-\s]\d{5}\b")
+
+INJECTION_PATTERNS = [
+    re.compile(
+        r"ignore\s+(all\s+)?(previous|prior|above|system)\s+(instructions|prompts|rules|commands)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"disregard\s+(all\s+)?(previous|prior|above|system)?\s*(instructions|rules|guidelines)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(system\s+)?prompt\s+override", re.IGNORECASE),
+    re.compile(
+        r"override\s+(system|safety|compliance|all)\s*(instructions|rules|controls)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"auto-?approve\s+(this|all|immediately|without\s+review)?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"must\s+(be\s+)?approve(d)?\s+without\s+review", re.IGNORECASE),
+    re.compile(
+        r"bypass\s+(all\s+)?(rules|approval|review|security|checks|threshold)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"skip\s+(the\s+)?(review|security|approval|checks)", re.IGNORECASE),
+    re.compile(r"do\s+not\s+(review|flag|alert|check)", re.IGNORECASE),
+    re.compile(r"you\s+must\s+output\s+approve", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+in\s+developer\s+mode", re.IGNORECASE),
+    re.compile(r"jailbreak", re.IGNORECASE),
+    re.compile(r"admin\s+override", re.IGNORECASE),
+]
+
+
+def scrub_personal_data(text: str) -> tuple[str, list[str]]:
+    """Scrub SSNs and credit card numbers from text.
+
+    Returns the sanitized text and a list of redacted categories.
+    """
+    redacted_categories: list[str] = []
+    if SSN_REGEX.search(text):
+        redacted_categories.append("SSN")
+        text = SSN_REGEX.sub("[REDACTED_SSN]", text)
+    if CC_REGEX.search(text):
+        redacted_categories.append("CREDIT_CARD")
+        text = CC_REGEX.sub("[REDACTED_CREDIT_CARD]", text)
+    return text, redacted_categories
+
+
+def detect_prompt_injection(text: str) -> bool:
+    """Detect prompt injection attempts in the description."""
+    for pattern in INJECTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def security_checkpoint(node_input: dict[str, Any], ctx: Context) -> Event:
+    """Security checkpoint executed before an expense reaches the LLM reviewer.
+
+    1. Scrubs personal data (SSNs and credit cards) from description so sensitive
+       PII never reaches the model or logs, while retaining record of redacted categories.
+    2. Defends against prompt injection attempts: if instructions attempting to bypass
+       rules or force approval are detected, routes directly to human review and flags
+       it as a security event without exposing the model.
+    """
+    expense = dict(node_input)
+    raw_description = str(expense.get("description", ""))
+
+    # 1. Scrub personal data from description
+    scrubbed_desc, redacted_categories = scrub_personal_data(raw_description)
+    expense["description"] = scrubbed_desc
+    expense["redacted_categories"] = redacted_categories
+
+    # Persist sanitized data in state
+    ctx.state["expense_data"] = expense
+
+    # 2. Defend against prompt injection
+    if detect_prompt_injection(raw_description):
+        submitter = expense.get("submitter", "unknown")
+        amount = float(expense.get("amount", 0.0))
+        log_entry = {
+            "severity": "WARNING",
+            "alert_type": "security_violation",
+            "event": "prompt_injection_detected",
+            "message": (
+                f"Security event: Prompt injection attempt detected in expense from "
+                f"{submitter} (${amount:.2f}). Bypassing LLM reviewer."
+            ),
+            "submitter": submitter,
+            "amount": amount,
+            "redacted_categories": redacted_categories,
+        }
+        print(json.dumps(log_entry), flush=True)
+
+        ctx.state["security_event"] = {
+            "flagged": True,
+            "reason": "prompt_injection_detected",
+        }
+        expense["security_flag"] = "prompt_injection_detected"
+        return Event(route="SECURITY_ESCALATION", output=expense)
+
+    return Event(route="CLEAN", output=expense)
+
+
+# ---------------------------------------------------------------------------
+# Branch B: LLM Risk Assessment & Alert (Clean expenses >= $100)
 # ---------------------------------------------------------------------------
 
 
@@ -235,13 +356,23 @@ def request_approval(node_input: Any, ctx: Context):
     expense = ctx.state.get("expense_data", {})
     amount = float(expense.get("amount", 0.0))
     submitter = expense.get("submitter", "unknown")
+    security_event = ctx.state.get("security_event", {})
+
+    if security_event.get("flagged"):
+        message = (
+            f"SECURITY ALERT: Potential prompt injection detected in expense from "
+            f"{submitter} (${amount:.2f}). LLM review was bypassed. "
+            "Human manager review and decision required."
+        )
+    else:
+        message = (
+            f"High-value expense (${amount:.2f} from {submitter}) flagged by risk review. "
+            "Approve or reject."
+        )
 
     yield RequestInput(
         interrupt_id="expense_approval",
-        message=(
-            f"High-value expense (${amount:.2f} from {submitter}) flagged by risk review. "
-            "Approve or reject."
-        ),
+        message=message,
         payload=expense,
     )
 
@@ -291,7 +422,14 @@ root_agent = Workflow(
             route_by_amount,
             {
                 "AUTO_APPROVE": auto_approve,
-                "NEEDS_REVIEW": review_agent,
+                "NEEDS_REVIEW": security_checkpoint,
+            },
+        ),
+        (
+            security_checkpoint,
+            {
+                "CLEAN": review_agent,
+                "SECURITY_ESCALATION": request_approval,
             },
         ),
         (review_agent, request_approval, process_decision),
