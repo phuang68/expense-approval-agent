@@ -24,7 +24,10 @@ load_dotenv()
 # --- Authentication Configuration ---
 # If GOOGLE_API_KEY is provided, use Google AI Studio.
 # Otherwise, default to Vertex AI with application default credentials.
-if os.getenv("GOOGLE_API_KEY"):
+api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+if api_key:
+    os.environ["GOOGLE_API_KEY"] = api_key
+    os.environ["GEMINI_API_KEY"] = api_key
     os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "False"
 else:
     try:
