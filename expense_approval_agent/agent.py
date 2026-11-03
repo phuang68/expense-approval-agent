@@ -181,7 +181,9 @@ def auto_approve(node_input: dict[str, Any]) -> Event:
 # Security Checkpoint: PII Redaction & Prompt Injection Defense
 # ---------------------------------------------------------------------------
 
-SSN_REGEX = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+SSN_REGEX = re.compile(
+    r"\b\d{3}-\d{2}-\d{4}\b|(?i:\bssn(?:\s+number)?(?:\s+is)?\s*[:#]?\s*)(\d{9,11})"
+)
 CC_REGEX = re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b|\b\d{4}[-\s]\d{6}[-\s]\d{5}\b")
 
 INJECTION_PATTERNS = [
@@ -224,7 +226,12 @@ def scrub_personal_data(text: str) -> tuple[str, list[str]]:
     redacted_categories: list[str] = []
     if SSN_REGEX.search(text):
         redacted_categories.append("SSN")
-        text = SSN_REGEX.sub("[REDACTED_SSN]", text)
+        text = re.sub(
+            r"((?i:\bssn(?:\s+number)?(?:\s+is)?\s*[:#]?\s*))\d{9,11}",
+            r"\1[REDACTED_SSN]",
+            text,
+        )
+        text = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED_SSN]", text)
     if CC_REGEX.search(text):
         redacted_categories.append("CREDIT_CARD")
         text = CC_REGEX.sub("[REDACTED_CREDIT_CARD]", text)
